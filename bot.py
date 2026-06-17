@@ -1,9 +1,8 @@
-import asyncio
 import logging
 import re
 from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
-from typing import Dict, Deque, List, Set, Optional
+from typing import Dict, Deque, Set
 
 from telegram import Update, ChatPermissions, MessageEntity
 from telegram.ext import (
@@ -45,10 +44,10 @@ flood_warnings: Dict[tuple, int] = defaultdict(int)
 # کاربرانی که استارت زده‌اند
 start_users: Set[int] = set()
 
-# گروه‌ها به همراه مالک
-groups: Dict[int, int] = {}        # chat_id -> owner_id
+# گروه‌ها به همراه مالک: chat_id -> owner_id
+groups: Dict[int, int] = {}
 
-# وضعیت بسته بودن گروه‌ها: chat_id -> bool
+# وضعیت بسته بودن گروه‌ها
 group_closed: Dict[int, bool] = {}
 
 # اعضای گروه: chat_id -> set of user_id
@@ -63,7 +62,7 @@ gif_spam: Dict[tuple, Deque[float]] = defaultdict(lambda: deque(maxlen=100))
 
 # -------------------- توابع کمکی --------------------
 def clean_text(text: str) -> str:
-    """حذف تمام کاراکترهای غیر فارسی/عربی و فاصله‌ها برای تشخیص فحش"""
+    """حذف تمام کاراکترهای غیر فارسی/عربی برای تشخیص فحش"""
     return re.sub(r'[^\u0600-\u06FF]', '', text)
 
 BAD_WORDS_RAW = [
@@ -112,7 +111,11 @@ async def mute_user(chat_id: int, user_id: int, duration_seconds: int, context: 
 async def kick_user(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE):
     """کیک کردن کاربر (اخراج بدون بن دائم)"""
     await context.bot.ban_chat_member(chat_id, user_id)
-    await context.bot.unban_chat_member(chat_id, user_id)  # امکان ورود مجدد
+    await context.bot.unban_chat_member(chat_id, user_id)
+
+async def get_owner_id(chat_id: int) -> int:
+    """دریافت شناسه مالک از دیکشنری"""
+    return groups.get(chat_id)
 
 # -------------------- مدیریت بنر --------------------
 def schedule_banner_job(owner_id: int, chat_id: int, interval: int, job_queue, banner_callback):
@@ -149,7 +152,6 @@ async def banner_sender(context: ContextTypes.DEFAULT_TYPE):
         )
     except Exception as e:
         logging.error(f"خطا در ارسال بنر: {e}")
-        # اگر خطا باشد (مثل حذف پیام اصلی)، بنر غیرفعال شود
         banners[owner_id]['active'] = False
         context.job.schedule_removal()
 
@@ -179,18 +181,59 @@ async def new_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     for member in update.message.new_chat_members:
         user_id = member.id
-        mention = f"@{member.username}" if member.username else member.full_name
+        # ذکر نام کاربری
+        if member.username:
+            mention = f"@{member.username}"
+        else:
+            mention = f"[{member.full_name}](tg://user?id={user_id})"
         welcome_text = f"سلام خوش اومدی {mention} به گروه 🖐️♥️"
-        await context.bot.send_message(chat_id, welcome_text)
+        await context.bot.send_message(chat_id, welcome_text, parse_mode=ParseMode.MARKDOWN)
         group_members[chat_id].add(user_id)
+    # حذف پیام جوین
     await update.message.delete()
 
 async def left_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    user_id = update.message.left_chat_member.id
-    await context.bot.send_message(chat_id, "🥺😞")
+    user = update.message.left_chat_member
+    user_id = user.id
+
+    # ساخت Mention
+    if user.username:
+        mention = f"@{user.username}"
+    else:
+        mention = f"[{user.full_name}](tg://user?id={user_id})"
+    await context.bot.send_message(chat_id, f"{mention} 😞🥺", parse_mode=ParseMode.MARKDOWN)
     await update.message.delete()
     group_members[chat_id].discard(user_id)
+
+async def kick_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """دستور Kick: فقط مالک می‌تواند کاربر را کیک کند"""
+    chat_id = update.effective_chat.id
+    user = update.effective_user
+    message = update.effective_message
+
+    # فقط مالک
+    owner_id = await get_owner_id(chat_id)
+    if user.id != owner_id:
+        await message.reply_text("⛔ فقط مالک گروه می‌تواند از این دستور استفاده کند.")
+        return
+
+    # دریافت آرگومان (شناسه کاربر هدف)
+    args = message.text.split()
+    if len(args) < 2:
+        await message.reply_text("لطفاً شناسه کاربر را وارد کنید.\nمثال: `kick 123456789`", parse_mode=ParseMode.MARKDOWN)
+        return
+
+    target_id_str = args[1]
+    try:
+        target_id = int(target_id_str)
+    except ValueError:
+        await message.reply_text("شناسه کاربر باید عدد باشد.")
+        return
+
+    # کیک
+    await kick_user(chat_id, target_id, context)
+    await message.reply_text(f"✅ کاربر با شناسه {target_id} از گروه اخراج شد.")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.effective_message
@@ -200,34 +243,35 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not message or not chat_id:
         return
 
-    # --------------------- دستورات Close/Open ---------------------
-    if message.text and message.text.strip() in ["Close", "open"]:
-        if await is_admin(chat_id, user_id, context):
-            cmd = message.text.strip()
-            if cmd == "Close":
-                await context.bot.set_chat_permissions(
-                    chat_id,
-                    ChatPermissions(can_send_messages=False)
-                )
-                group_closed[chat_id] = True
-                await message.reply_text("🔒 گروه بسته شد.")
-            else:
-                await context.bot.set_chat_permissions(
-                    chat_id,
-                    ChatPermissions(
-                        can_send_messages=True,
-                        can_send_media_messages=True,
-                        can_send_polls=True,
-                        can_send_other_messages=True,
-                        can_add_web_page_previews=True
+    # --------------------- دستورات Close/Open (بدون حساسیت) ---------------------
+    if message.text:
+        cmd = message.text.strip().lower()
+        if cmd in ["close", "open"]:
+            if await is_admin(chat_id, user_id, context):
+                if cmd == "close":
+                    await context.bot.set_chat_permissions(
+                        chat_id,
+                        ChatPermissions(can_send_messages=False)
                     )
-                )
-                group_closed[chat_id] = False
-                await message.reply_text("🔓 گروه باز شد.")
-            return
-        else:
-            await message.reply_text("⛔ فقط مدیران یا مالک می‌توانند گروه را باز/بسته کنند.")
-            return
+                    group_closed[chat_id] = True
+                    await message.reply_text("🔒 گروه بسته شد.")
+                else:  # open
+                    await context.bot.set_chat_permissions(
+                        chat_id,
+                        ChatPermissions(
+                            can_send_messages=True,
+                            can_send_media_messages=True,
+                            can_send_polls=True,
+                            can_send_other_messages=True,
+                            can_add_web_page_previews=True
+                        )
+                    )
+                    group_closed[chat_id] = False
+                    await message.reply_text("🔓 گروه باز شد.")
+                return
+            else:
+                await message.reply_text("⛔ فقط مدیران یا مالک می‌توانند گروه را باز/بسته کنند.")
+                return
 
     # --------------------- فیلتر لینک / فروارد ---------------------
     if has_link(message):
@@ -250,7 +294,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         current_warnings = media_warnings[key]
         if current_warnings >= 3:
             await mute_user(chat_id, user_id, MEDIA_MUTE_DURATION, context)
-            del media_warnings[key]  # ریست اخطارها
+            del media_warnings[key]
             await context.bot.send_message(chat_id, f"⛔ کاربر [{user.full_name}](tg://user?id={user_id}) به دلیل ارسال مکرر عکس/فیلم ۳ ساعت میوت شد.",
                                            parse_mode=ParseMode.MARKDOWN)
         else:
@@ -258,7 +302,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await message.delete()
         return
 
-    # --------------------- اسپم گیف/استیکر ---------------------
+    # --------------------- اسپم گیف/استیکر (حذف پیام) ---------------------
     if message.animation or message.sticker:
         key = (chat_id, user_id)
         now = datetime.now(timezone.utc).timestamp()
@@ -277,9 +321,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 del flood_warnings[flood_key]
                 await message.reply_text("⛔ شما به دلیل اسپم گیف/استیکر ۵ دقیقه میوت شدید.")
                 dq.clear()
+            await message.delete()  # حذف پیام اسپم
             return
 
-    # --------------------- اسپم عمومی ---------------------
+    # --------------------- اسپم عمومی (حذف پیام) ---------------------
     now = datetime.now(timezone.utc).timestamp()
     spam_key = (chat_id, user_id)
     spam_deque = general_spam[spam_key]
@@ -290,6 +335,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await mute_user(chat_id, user_id, SPAM_MUTE_DURATION, context)
         await message.reply_text("⛔ به دلیل اسپم ۲ دقیقه میوت شدید.")
         spam_deque.clear()
+        await message.delete()  # حذف پیام اسپم
 
 async def bot_added_to_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
@@ -301,7 +347,7 @@ async def bot_added_to_group(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 groups[chat_id] = admin.user.id
                 group_closed[chat_id] = False
                 break
-    except:
+    except Exception:
         pass
 
 async def bot_removed_from_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -330,6 +376,7 @@ def main():
     app = Application.builder().token(TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("kick", kick_command))   # <-- فرمان جدید
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, new_member))
     app.add_handler(MessageHandler(filters.StatusUpdate.LEFT_CHAT_MEMBER, left_member))
     app.add_handler(ChatMemberHandler(bot_added_to_group, ChatMemberHandler.CHAT_MEMBER))
@@ -338,10 +385,7 @@ def main():
                                    handle_message), group=1)
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & ~filters.COMMAND, private_message))
 
-    # بازیابی بنرهای فعال (اما چون همه چیز در حافظه است و تازه شروع شده، چیزی نیست)
-    # در صورت نیاز می‌توانید بنرها را دستی تنظیم کنید.
-
-    print("✅ ربات بدون دیتابیس اجرا شد...")
+    print("✅ ربات (نسخه اصلاح‌شده) اجرا شد...")
     app.run_polling()
 
 if __name__ == "__main__":
